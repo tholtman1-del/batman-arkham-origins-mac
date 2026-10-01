@@ -1,0 +1,1074 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 23b0a6f..393fb96 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -26,12 +26,82 @@
+ 
+ #include <algorithm>
+ #include <cfloat>
++#include <chrono>
+ #ifdef MSC_VER
+ #pragma fenv_access (on)
+ #endif
+ 
+ namespace dxvk {
+ 
++  // Diagnostic profiler (DXVK_D3D9_PROFILE=1): logs per-second counts and
++  // time spent in expensive D3D9 entry points.
++  namespace {
++    using ProfClock = std::chrono::high_resolution_clock;
++
++    struct ProfStat {
++      uint64_t count = 0;
++      uint64_t ns    = 0;
++      uint64_t bytes = 0;
++    };
++
++    struct ProfData {
++      bool     enabled = env::getEnvVar("DXVK_D3D9_PROFILE") == "1";
++      ProfStat lockImg, unlockImg, lockBuf, unlockBuf, getRTData, updTex, updSurf, stretch, present, create, drawUP, drawIdxUP, upCopy;
++      uint64_t upRename = 0;
++      uint64_t lockImgPool[4] = { };  // DEFAULT, MANAGED, SYSTEMMEM, SCRATCH
++      uint64_t lockImgFlag[4] = { };  // none, DISCARD, READONLY, NOOVERWRITE/other
++      uint64_t lockBufFlag[4] = { };  // none, DISCARD, READONLY, NOOVERWRITE
++      ProfClock::time_point last = ProfClock::now();
++    };
++
++    ProfData g_prof;
++
++    struct ProfScope {
++      ProfStat& stat;
++      ProfClock::time_point start;
++      ProfScope(ProfStat& s, uint64_t bytes = 0) : stat(s), start(ProfClock::now()) { stat.bytes += bytes; }
++      ~ProfScope() {
++        stat.count += 1;
++        stat.ns    += std::chrono::duration_cast<std::chrono::nanoseconds>(ProfClock::now() - start).count();
++      }
++    };
++
++    std::string profFormat(const char* name, const ProfStat& s) {
++      return str::format(" ", name, "=", s.count, "/", s.ns / 1000000, "ms", s.bytes ? str::format("/", s.bytes >> 20, "MiB") : std::string());
++    }
++
++    void profFlush() {
++      auto now = ProfClock::now();
++      if (now - g_prof.last < std::chrono::seconds(1))
++        return;
++
++      Logger::warn(str::format("D3D9PROF",
++        profFormat("present", g_prof.present),
++        profFormat("lockImg", g_prof.lockImg), profFormat("unlockImg", g_prof.unlockImg),
++        profFormat("lockBuf", g_prof.lockBuf), profFormat("unlockBuf", g_prof.unlockBuf),
++        profFormat("getRTData", g_prof.getRTData), profFormat("updTex", g_prof.updTex),
++        profFormat("updSurf", g_prof.updSurf), profFormat("stretch", g_prof.stretch),
++        profFormat("create", g_prof.create),
++        profFormat("drawUP", g_prof.drawUP), profFormat("drawIdxUP", g_prof.drawIdxUP), profFormat("upCopy", g_prof.upCopy),
++        " upRename=", g_prof.upRename,
++        " imgPool[def,man,sys,scr]=", g_prof.lockImgPool[0], ",", g_prof.lockImgPool[1], ",", g_prof.lockImgPool[2], ",", g_prof.lockImgPool[3],
++        " imgFlag[none,disc,ro,other]=", g_prof.lockImgFlag[0], ",", g_prof.lockImgFlag[1], ",", g_prof.lockImgFlag[2], ",", g_prof.lockImgFlag[3],
++        " bufFlag[none,disc,ro,noow]=", g_prof.lockBufFlag[0], ",", g_prof.lockBufFlag[1], ",", g_prof.lockBufFlag[2], ",", g_prof.lockBufFlag[3]));
++
++      bool enabled = g_prof.enabled;
++      g_prof = ProfData();
++      g_prof.enabled = enabled;
++      g_prof.last = now;
++    }
++
++    uint32_t profFlagIndex(DWORD Flags) {
++      if (Flags & D3DLOCK_DISCARD)     return 1;
++      if (Flags & D3DLOCK_READONLY)    return 2;
++      if (Flags & D3DLOCK_NOOVERWRITE) return 3;
++      return 0;
++    }
++  }
++
+   D3D9DeviceEx::D3D9DeviceEx(
+           D3D9InterfaceEx*       pParent,
+           D3D9Adapter*           pAdapter,
+@@ -445,6 +515,7 @@ namespace dxvk {
+           D3DPOOL             Pool,
+           IDirect3DTexture9** ppTexture,
+           HANDLE*             pSharedHandle) {
++    ProfScope _prof(g_prof.create);
+     InitReturnPtr(ppTexture);
+ 
+     if (unlikely(ppTexture == nullptr))
+@@ -717,6 +788,7 @@ namespace dxvk {
+     const RECT*              pSourceRect,
+           IDirect3DSurface9* pDestinationSurface,
+     const POINT*             pDestPoint) {
++    ProfScope _prof(g_prof.updSurf);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     D3D9Surface* src = static_cast<D3D9Surface*>(pSourceSurface);
+@@ -787,6 +859,7 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::UpdateTexture(
+           IDirect3DBaseTexture9* pSourceTexture,
+           IDirect3DBaseTexture9* pDestinationTexture) {
++    ProfScope _prof(g_prof.updTex);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     if (!pDestinationTexture || !pSourceTexture)
+@@ -864,6 +937,7 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetRenderTargetData(
+           IDirect3DSurface9* pRenderTarget,
+           IDirect3DSurface9* pDestSurface) {
++    ProfScope _prof(g_prof.getRTData);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     D3D9Surface* src = static_cast<D3D9Surface*>(pRenderTarget);
+@@ -936,6 +1010,7 @@ namespace dxvk {
+           IDirect3DSurface9*   pDestSurface,
+     const RECT*                pDestRect,
+           D3DTEXTUREFILTERTYPE Filter) {
++    ProfScope _prof(g_prof.stretch);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     D3D9Surface* dst = static_cast<D3D9Surface*>(pDestSurface);
+@@ -2422,6 +2497,7 @@ namespace dxvk {
+       return S_OK;
+ 
+     PrepareDraw(PrimitiveType);
++    m_diagLastPrim = PrimitiveType; DiagOcclDraw(0);
+ 
+     EmitCs([this,
+       cPrimType    = PrimitiveType,
+@@ -2458,6 +2534,7 @@ namespace dxvk {
+       return S_OK;
+ 
+     PrepareDraw(PrimitiveType);
++    m_diagLastPrim = PrimitiveType; DiagOcclDraw(1);
+ 
+     EmitCs([this,
+       cPrimType        = PrimitiveType,
+@@ -2485,6 +2562,7 @@ namespace dxvk {
+           UINT             PrimitiveCount,
+     const void*            pVertexStreamZeroData,
+           UINT             VertexStreamZeroStride) {
++    ProfScope _prof(g_prof.drawUP);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     if (unlikely(m_state.vertexDecl == nullptr))
+@@ -2494,6 +2572,7 @@ namespace dxvk {
+       return S_OK;
+ 
+     PrepareDraw(PrimitiveType);
++    m_diagLastPrim = PrimitiveType; DiagOcclDraw(2);
+ 
+     auto drawInfo = GenerateDrawInfo(PrimitiveType, PrimitiveCount, 0);
+ 
+@@ -2501,7 +2580,10 @@ namespace dxvk {
+     const uint32_t bufferSize = GetUPBufferSize(drawInfo.vertexCount, VertexStreamZeroStride);
+ 
+     auto upSlice = AllocTempBuffer<true>(bufferSize);
+-    FillUPVertexBuffer(upSlice.mapPtr, pVertexStreamZeroData, dataSize, bufferSize);
++    {
++      ProfScope _copy(g_prof.upCopy, bufferSize);
++      FillUPVertexBuffer(upSlice.mapPtr, pVertexStreamZeroData, dataSize, bufferSize);
++    }
+ 
+     EmitCs([this,
+       cBufferSlice  = std::move(upSlice.slice),
+@@ -2538,6 +2620,52 @@ namespace dxvk {
+           D3DFORMAT        IndexDataFormat,
+     const void*            pVertexStreamZeroData,
+           UINT             VertexStreamZeroStride) {
++    { // Diagnostic: DXVK_D3D9_OCCL_FIX=nocull|colorwrite|both changes state of occlusion test draws
++      static const std::string fix = env::getEnvVar("DXVK_D3D9_OCCL_FIX");
++      if (unlikely(!fix.empty()) && m_diagOcclQuery && !m_diagInFix) {
++        const bool nocull = fix == "nocull" || fix == "both";
++        const bool cw     = fix == "colorwrite" || fix == "both";
++        const bool bias   = fix == "bias";
++        DWORD saved[8];
++        const D3DRENDERSTATETYPE rsList[8] = { D3DRS_CULLMODE, D3DRS_COLORWRITEENABLE, D3DRS_ALPHABLENDENABLE,
++          D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_DEPTHBIAS };
++        for (int i = 0; i < 8; i++) GetRenderState(rsList[i], &saved[i]);
++        if (bias) {
++          static const float amount = [] {
++            auto v = env::getEnvVar("DXVK_D3D9_OCCL_BIAS");
++            return v.empty() ? -0.00002f : float(std::atof(v.c_str()));
++          }();
++          SetRenderState(D3DRS_DEPTHBIAS, bit::cast<DWORD>(amount));
++        }
++        if (nocull) SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
++        if (cw) {
++          SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
++          SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
++          SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
++          SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
++          SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
++          SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
++        }
++        m_diagInFix = true;
++        HRESULT hr = DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount,
++          pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
++        m_diagInFix = false;
++        for (int i = 0; i < 8; i++) SetRenderState(rsList[i], saved[i]);
++        return hr;
++      }
++    }
++    { // Occlusion hysteresis (DXVK_D3D9_OCCL_HYST_MS): identify the tested box by its vertices
++      static const bool hyst = !env::getEnvVar("DXVK_D3D9_OCCL_HYST_MS").empty();
++      if (hyst && m_diagOcclQuery && pVertexStreamZeroData && !m_diagOcclQuery->m_boxHash) {
++        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pVertexStreamZeroData)
++          + size_t(MinVertexIndex) * VertexStreamZeroStride;
++        size_t len = size_t(NumVertices) * VertexStreamZeroStride;
++        uint64_t h = 1469598103934665603ull;
++        for (size_t k = 0; k < len; k++) { h ^= bytes[k]; h *= 1099511628211ull; }
++        m_diagOcclQuery->m_boxHash = h | 1;
++      }
++    }
++    ProfScope _prof(g_prof.drawIdxUP);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     if (unlikely(m_state.vertexDecl == nullptr))
+@@ -2547,6 +2675,7 @@ namespace dxvk {
+       return S_OK;
+ 
+     PrepareDraw(PrimitiveType);
++    m_diagLastPrim = PrimitiveType; DiagOcclDraw(3);
+ 
+     auto drawInfo = GenerateDrawInfo(PrimitiveType, PrimitiveCount, 0);
+ 
+@@ -3469,6 +3598,9 @@ namespace dxvk {
+           HWND hDestWindowOverride,
+     const RGNDATA* pDirtyRegion,
+           DWORD dwFlags) {
++    if (g_prof.enabled)
++      profFlush();
++    ProfScope _prof(g_prof.present);
+     return m_implicitSwapchain->Present(
+       pSourceRect,
+       pDestRect,
+@@ -4022,6 +4154,8 @@ namespace dxvk {
+         currentSlice.slice  = DxvkBufferSlice(m_dxvkDevice->createBuffer(info, memoryFlags));
+         currentSlice.mapPtr = currentSlice.slice.mapPtr(0);
+       } else if (unlikely(currentSlice.slice.length() < size)) {
++        if constexpr (UpBuffer)
++          g_prof.upRename++;
+         auto physSlice = currentSlice.slice.buffer()->allocSlice();
+ 
+         currentSlice.slice  = DxvkBufferSlice(currentSlice.slice.buffer());
+@@ -4151,6 +4285,9 @@ namespace dxvk {
+             D3DLOCKED_BOX*          pLockedBox,
+       const D3DBOX*                 pBox,
+             DWORD                   Flags) {
++    ProfScope _prof(g_prof.lockImg);
++    g_prof.lockImgPool[std::min<uint32_t>(pResource->Desc()->Pool, 3)]++;
++    g_prof.lockImgFlag[profFlagIndex(Flags)]++;
+     D3D9DeviceLock lock = LockDevice();
+ 
+     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
+@@ -4401,6 +4538,7 @@ namespace dxvk {
+         D3D9CommonTexture*      pResource,
+         UINT                    Face,
+         UINT                    MipLevel) {
++    ProfScope _prof(g_prof.unlockImg);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
+@@ -4626,6 +4764,8 @@ namespace dxvk {
+           UINT                    SizeToLock,
+           void**                  ppbData,
+           DWORD                   Flags) {
++    ProfScope _prof(g_prof.lockBuf, SizeToLock);
++    g_prof.lockBufFlag[profFlagIndex(Flags)]++;
+     D3D9DeviceLock lock = LockDevice();
+ 
+     if (unlikely(ppbData == nullptr))
+@@ -4781,6 +4921,7 @@ namespace dxvk {
+ 
+   HRESULT D3D9DeviceEx::UnlockBuffer(
+         D3D9CommonBuffer*       pResource) {
++    ProfScope _prof(g_prof.unlockBuf);
+     D3D9DeviceLock lock = LockDevice();
+ 
+     if (pResource->DecrementLockCount() != 0)
+@@ -5981,8 +6122,11 @@ namespace dxvk {
+       info.addressModeU   = DecodeAddressMode(cKey.AddressU);
+       info.addressModeV   = DecodeAddressMode(cKey.AddressV);
+       info.addressModeW   = DecodeAddressMode(cKey.AddressW);
+-      info.compareToDepth = cKey.Depth;
+-      info.compareOp      = cKey.Depth ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_NEVER;
++      // The depth compare is emulated in the shader (dxso_compiler.cpp, Metal can't
++      // alias depth/color bindings), so the sampler itself must not compare: a
++      // compare-enabled sampler used with a plain sample is undefined on MoltenVK.
++      info.compareToDepth = VK_FALSE;
++      info.compareOp      = VK_COMPARE_OP_NEVER;
+       info.magFilter      = DecodeFilter(cKey.MagFilter);
+       info.minFilter      = DecodeFilter(cKey.MinFilter);
+       info.mipmapMode     = mipFilter.MipFilter;
+@@ -6457,9 +6601,57 @@ namespace dxvk {
+   }
+ 
+ 
++  void D3D9DeviceEx::DiagOcclDraw(uint32_t drawType) {
++    static const bool diag = env::getEnvVar("DXVK_D3D9_OCCLUSION_DIAG") == "1";
++    if (likely(!diag) || !m_diagOcclQuery)
++      return;
++    const auto& rs = m_state.renderStates;
++    auto* ds = m_state.depthStencil.ptr();
++    auto* rt = m_state.renderTargets[0].ptr();
++    const auto& vp = m_state.viewport;
++    uint64_t g = 0;
++    g |= uint64_t(drawType & 3);
++    g |= uint64_t(rs[D3DRS_ZENABLE] & 3) << 2;
++    g |= uint64_t(rs[D3DRS_ZFUNC] & 15) << 4;
++    g |= uint64_t(rs[D3DRS_ZWRITEENABLE] ? 1 : 0) << 8;
++    g |= uint64_t(rs[D3DRS_COLORWRITEENABLE] & 15) << 9;
++    g |= uint64_t(rs[D3DRS_CULLMODE] & 3) << 13;
++    g |= uint64_t(rs[D3DRS_STENCILENABLE] ? 1 : 0) << 15;
++    g |= uint64_t(rs[D3DRS_ALPHATESTENABLE] ? 1 : 0) << 16;
++    g |= uint64_t(rs[D3DRS_SCISSORTESTENABLE] ? 1 : 0) << 17;
++    g |= uint64_t(vp.MinZ == 0.0f ? 1 : 0) << 18;
++    g |= uint64_t(vp.MaxZ == 1.0f ? 1 : 0) << 19;
++    g |= uint64_t(ds ? 1 : 0) << 20;
++    if (ds) g |= uint64_t(uint32_t(ds->GetCommonTexture()->Desc()->Format) & 255) << 21;
++    if (rt) g |= uint64_t(uint32_t(rt->GetCommonTexture()->Desc()->Format) & 255) << 29;
++    if (ds && rt) {
++      auto de = ds->GetSurfaceExtent(), re = rt->GetSurfaceExtent();
++      g |= uint64_t(de.width == re.width && de.height == re.height ? 1 : 0) << 37;
++      g |= uint64_t(de.width > re.width || de.height > re.height ? 1 : 0) << 38;
++    }
++    g |= uint64_t(m_state.vertexShader != nullptr ? 1 : 0) << 39;
++    g |= uint64_t(m_state.pixelShader != nullptr ? 1 : 0) << 40;
++    if (rt) {
++      auto re = rt->GetSurfaceExtent();
++      g |= uint64_t(vp.X == 0 && vp.Y == 0 && vp.Width == re.width && vp.Height == re.height ? 1 : 0) << 41;
++    }
++    g |= uint64_t(rt ? 1 : 0) << 42;
++    g |= uint64_t(m_diagLastPrim & 7) << 43;
++    g |= uint64_t(rs[D3DRS_CCW_STENCILFUNC] & 0 /* reserved */) << 46;
++    g |= uint64_t(rs[D3DRS_TWOSIDEDSTENCILMODE] ? 1 : 0) << 48;
++    g |= uint64_t((rs[D3DRS_DEPTHBIAS] || rs[D3DRS_SLOPESCALEDEPTHBIAS]) ? 1 : 0) << 49;
++    if (!m_diagOcclQuery->m_diagDraws)
++      m_diagOcclQuery->m_diagSig = g;
++    m_diagOcclQuery->m_diagDraws++;
++  }
++
++
+   void D3D9DeviceEx::Begin(D3D9Query* pQuery) {
+     D3D9DeviceLock lock = LockDevice();
+ 
++    if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION)
++      m_diagOcclQuery = pQuery;
++
+     EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
+       cQuery->Begin(ctx);
+     });
+@@ -6469,6 +6661,9 @@ namespace dxvk {
+   void D3D9DeviceEx::End(D3D9Query* pQuery) {
+     D3D9DeviceLock lock = LockDevice();
+ 
++    if (m_diagOcclQuery == pQuery)
++      m_diagOcclQuery = nullptr;
++
+     EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
+       cQuery->End(ctx);
+     });
+diff --git a/src/d3d9/d3d9_device.h b/src/d3d9/d3d9_device.h
+index cec4829..86dd46e 100644
+--- a/src/d3d9/d3d9_device.h
++++ b/src/d3d9/d3d9_device.h
+@@ -892,6 +892,12 @@ namespace dxvk {
+     void Begin(D3D9Query* pQuery);
+     void End(D3D9Query* pQuery);
+ 
++    // Diagnostics (DXVK_D3D9_OCCLUSION_DIAG=1): state of draws inside occlusion queries
++    D3D9Query* m_diagOcclQuery = nullptr;
++    uint32_t   m_diagLastPrim  = 0;
++    bool       m_diagInFix     = false;
++    void DiagOcclDraw(uint32_t drawType);
++
+     void SetVertexBoolBitfield(uint32_t idx, uint32_t mask, uint32_t bits);
+     void SetPixelBoolBitfield (uint32_t idx, uint32_t mask, uint32_t bits);
+ 
+diff --git a/src/d3d9/d3d9_include.h b/src/d3d9/d3d9_include.h
+index 8762265..82e6629 100644
+--- a/src/d3d9/d3d9_include.h
++++ b/src/d3d9/d3d9_include.h
+@@ -79,10 +79,7 @@
+ 
+ // MinGW headers are broken. Who'dve guessed?
+ #ifndef _MSC_VER
+-typedef struct _D3DDEVINFO_RESOURCEMANAGER
+-{
+-  char dummy;
+-} D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
++// (D3DDEVINFO_RESOURCEMANAGER is provided by mingw-w64 >= 12 headers.)
+ 
+ #ifndef __WINE__
+ extern "C" WINUSERAPI WINBOOL WINAPI SetProcessDPIAware(VOID);
+diff --git a/src/d3d9/d3d9_query.cpp b/src/d3d9/d3d9_query.cpp
+index a487325..e247f5b 100644
+--- a/src/d3d9/d3d9_query.cpp
++++ b/src/d3d9/d3d9_query.cpp
+@@ -1,4 +1,11 @@
+ #include "d3d9_query.h"
++#include "../util/util_env.h"
++#include <algorithm>
++#include <chrono>
++#include <vector>
++#include <unordered_map>
++#include <cstdlib>
++#include <atomic>
+ 
+ #include "d3d9_device.h"
+ 
+@@ -99,7 +106,12 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE D3D9Query::Issue(DWORD dwIssueFlags) {
+     // Note: No need to submit to CS if we don't do anything!
+ 
++    m_zeroSinceUs = 0;
++
+     if (dwIssueFlags == D3DISSUE_BEGIN) {
++      m_diagSig = 0;
++      m_diagDraws = 0;
++      m_boxHash = 0;
+       if (QueryBeginnable(m_queryType)) {
+         if (m_state == D3D9_VK_QUERY_BEGUN && QueryEndable(m_queryType)) {
+           m_resetCtr.fetch_add(1, std::memory_order_acquire);
+@@ -143,6 +155,9 @@ namespace dxvk {
+       return D3D_OK;
+     }
+ 
++    m_latPolls++;
++    m_latFlush |= (dwGetDataFlags & D3DGETDATA_FLUSH) != 0;
++
+     HRESULT hr = this->GetQueryData(pData, dwSize);
+ 
+     bool flush = dwGetDataFlags & D3DGETDATA_FLUSH;
+@@ -223,6 +238,143 @@ namespace dxvk {
+ 
+         case D3DQUERYTYPE_OCCLUSION:
+           m_dataCache.Occlusion = DWORD(queryData[0].occlusion.samplesPassed);
++          { // Diagnostic: DXVK_D3D9_OCCL_LATENCY=1 logs time from End() to available result.
++            static const bool lat = env::getEnvVar("DXVK_D3D9_OCCL_LATENCY") == "1";
++            if (lat && m_latEndUs) {
++              static uint64_t n = 0, sumUs = 0, maxUs = 0, b10 = 0, b33 = 0, b100 = 0, bMore = 0, polls = 0, flushed = 0;
++              static int64_t lastLog = 0;
++              int64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++              uint64_t l = uint64_t(std::max<int64_t>(0, nowUs - m_latEndUs));
++              n++; sumUs += l; maxUs = std::max(maxUs, l); polls += m_latPolls; flushed += m_latFlush;
++              if (l < 10000) b10++; else if (l < 33000) b33++; else if (l < 100000) b100++; else bMore++;
++              if (nowUs - lastLog > 2000000) {
++                Logger::warn(str::format("OCCLLAT n=", n, " avg=", n ? sumUs / n / 1000 : 0, "ms max=", maxUs / 1000,
++                  "ms <10ms=", b10, " <33ms=", b33, " <100ms=", b100, " >=100ms=", bMore,
++                  " polls/q=", n ? polls / n : 0, " flushFlag=", flushed));
++                n = sumUs = maxUs = b10 = b33 = b100 = bMore = polls = flushed = 0;
++                lastLog = nowUs;
++              }
++            }
++          }
++          { // DXVK_D3D9_OCCL_HYST_MS=n: a box that was visible within n ms keeps
++            // reporting visible (masks sporadic false zeros). Logs flicker statistics.
++            static const int64_t hystUs = [] {
++              auto v = env::getEnvVar("DXVK_D3D9_OCCL_HYST_MS");
++              return v.empty() ? -1 : int64_t(1000) * std::atoi(v.c_str());
++            }();
++            if (hystUs >= 0 && m_boxHash) {
++              struct BoxState { int64_t lastVisUs = 0; int64_t lastZeroUs = 0; bool lastVis = false; };
++              static std::unordered_map<uint64_t, BoxState> boxes;
++              static uint64_t nq = 0, nz = 0, flipBack = 0, masked = 0;
++              static int64_t lastLogUs = 0;
++              int64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++              auto& b = boxes[m_boxHash];
++              nq++;
++              if (m_dataCache.Occlusion) {
++                // visible again shortly after a zero: likely a false zero
++                if (!b.lastVis && b.lastZeroUs && nowUs - b.lastZeroUs < 100000) flipBack++;
++                b.lastVis = true; b.lastVisUs = nowUs;
++              } else {
++                nz++;
++                b.lastVis = false; b.lastZeroUs = nowUs;
++                if (b.lastVisUs && nowUs - b.lastVisUs < hystUs) {
++                  m_dataCache.Occlusion = 1;
++                  masked++;
++                }
++              }
++              if (nowUs - lastLogUs > 2000000) {
++                Logger::warn(str::format("OCCLHYST q=", nq, " zero=", nz, " zero->vis within 100ms=", flipBack,
++                  " masked=", masked, " boxes=", boxes.size()));
++                nq = nz = flipBack = masked = 0; lastLogUs = nowUs;
++                if (boxes.size() > 200000) boxes.clear();
++              }
++            }
++          }
++          { // Diagnostic: DXVK_D3D9_OCCLUSION_DIAG=1 groups results by draw state signature.
++            static const bool diag = env::getEnvVar("DXVK_D3D9_OCCLUSION_DIAG") == "1";
++            if (diag) {
++              struct Agg { uint64_t n = 0, zero = 0, draws = 0; };
++              static std::unordered_map<uint64_t, Agg> map;
++              static auto last = std::chrono::steady_clock::now();
++              uint64_t key = m_diagDraws ? m_diagSig : ~0ull;
++              auto& a = map[key];
++              a.n++; a.draws += m_diagDraws;
++              if (!m_dataCache.Occlusion) a.zero++;
++              auto now = std::chrono::steady_clock::now();
++              if (now - last >= std::chrono::seconds(10)) {
++                last = now;
++                std::vector<std::pair<uint64_t, Agg>> v(map.begin(), map.end());
++                std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second.n > y.second.n; });
++                Logger::warn(str::format("OCCLDIAG ---- ", v.size(), " signatures"));
++                for (size_t i = 0; i < v.size() && i < 25; i++) {
++                  uint64_t g = v[i].first; auto& b = v[i].second;
++                  if (g == ~0ull) {
++                    Logger::warn(str::format("OCCLDIAG n=", b.n, " zero=", b.zero, " [no draws in query]"));
++                    continue;
++                  }
++                  Logger::warn(str::format("OCCLDIAG n=", b.n, " zero=", b.zero, " draws/q=", b.draws / b.n,
++                    " type=", g & 3, " zen=", (g >> 2) & 3, " zfunc=", (g >> 4) & 15, " zw=", (g >> 8) & 1,
++                    " cw=", (g >> 9) & 15, " cull=", (g >> 13) & 3, " sten=", (g >> 15) & 1, " atest=", (g >> 16) & 1,
++                    " sciss=", (g >> 17) & 1, " vpMinZ0=", (g >> 18) & 1, " vpMaxZ1=", (g >> 19) & 1,
++                    " hasDS=", (g >> 20) & 1, " dsFmt=", (g >> 21) & 255, " rtFmt=", (g >> 29) & 255,
++                    " dsEqRt=", (g >> 37) & 1, " dsBigger=", (g >> 38) & 1, " vs=", (g >> 39) & 1, " ps=", (g >> 40) & 1,
++                    " vpFull=", (g >> 41) & 1, " hasRT=", (g >> 42) & 1, " prim=", (g >> 43) & 7,
++                    " ccw=", (g >> 46) & 3, " twoSided=", (g >> 48) & 1, " zbias=", (g >> 49) & 1));
++                }
++                map.clear();
++              }
++            }
++          }
++          { // Diagnostic: DXVK_D3D9_OCCLUSION_RECHECK_MS=n re-reads a zero result
++            // after n ms before accepting it (tests for results read too early).
++            static const uint64_t recheckUs = 1000ull * std::max(0, std::atoi(
++              env::getEnvVar("DXVK_D3D9_OCCLUSION_RECHECK_MS").c_str()));
++            static std::atomic<uint32_t> flips = { 0u }, confirmed = { 0u };
++            if (recheckUs) {
++              uint64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++              if (!m_dataCache.Occlusion) {
++                if (!m_zeroSinceUs) { m_zeroSinceUs = nowUs; return S_FALSE; }
++                if (nowUs - m_zeroSinceUs < recheckUs) return S_FALSE;
++                confirmed++;
++              } else if (m_zeroSinceUs) {
++                flips++;
++              }
++              m_zeroSinceUs = 0;
++              static uint64_t lastUs = 0;
++              if (nowUs - lastUs > 1000000) {
++                Logger::warn(str::format("OCCL recheck: zero->nonzero flips ", flips.exchange(0),
++                  ", zeros confirmed ", confirmed.exchange(0)));
++                lastUs = nowUs;
++              }
++            }
++          }
++          { // Diagnostic: DXVK_D3D9_OCCLUSION_STATS=1 logs per-second result statistics.
++            static const bool stats = env::getEnvVar("DXVK_D3D9_OCCLUSION_STATS") == "1";
++            if (stats) {
++              static uint32_t total = 0, zero[3] = { }, all[3] = { };
++              static auto last = std::chrono::steady_clock::now();
++              size_t h = std::min<size_t>(m_query[0]->handleCount(), 2);
++              total++; all[h]++;
++              if (!m_dataCache.Occlusion) zero[h]++;
++              auto now = std::chrono::steady_clock::now();
++              if (now - last >= std::chrono::seconds(1)) {
++                Logger::warn(str::format("OCCL total=", total,
++                  " handles0: ", all[0], " (zero ", zero[0], ")",
++                  " handles1: ", all[1], " (zero ", zero[1], ")",
++                  " handles2+: ", all[2], " (zero ", zero[2], ")"));
++                total = 0; for (int i = 0; i < 3; i++) zero[i] = all[i] = 0;
++                last = now;
++              }
++            }
++          }
++          { // Diagnostic: DXVK_D3D9_OCCLUSION_VISIBLE=1 reports every occlusion query as visible.
++            static const bool alwaysVisible = env::getEnvVar("DXVK_D3D9_OCCLUSION_VISIBLE") == "1";
++            if (alwaysVisible)
++              m_dataCache.Occlusion = std::max<DWORD>(m_dataCache.Occlusion, 1u << 20);
++          }
+           break;
+ 
+         case D3DQUERYTYPE_TIMESTAMP:
+diff --git a/src/d3d9/d3d9_query.h b/src/d3d9/d3d9_query.h
+index 8d742c9..6c00203 100644
+--- a/src/d3d9/d3d9_query.h
++++ b/src/d3d9/d3d9_query.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <chrono>
++
+ #include "d3d9_device_child.h"
+ 
+ #include "../dxvk/dxvk_context.h"
+@@ -59,7 +61,19 @@ namespace dxvk {
+       return m_stallFlag;
+     }
+ 
++    uint64_t m_diagSig   = 0;
++    uint64_t m_boxHash   = 0;  // hash of the occlusion box vertices (identifies the primitive)
++    uint32_t m_diagDraws = 0;
++
++    int64_t  m_latEndUs  = 0;   // diagnostics: query result latency
++    uint32_t m_latPolls  = 0;
++    bool     m_latFlush  = false;
++
+     void NotifyEnd() {
++      m_latEndUs = std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++      m_latPolls = 0;
++      m_latFlush = false;
+       m_stallMask <<= 1;
+     }
+ 
+@@ -84,6 +98,9 @@ namespace dxvk {
+ 
+     D3D9_QUERY_DATA m_dataCache;
+ 
++    // Diagnostic re-check of zero occlusion results (DXVK_D3D9_OCCLUSION_RECHECK_MS)
++    uint64_t m_zeroSinceUs = 0;
++
+     UINT64 GetTimestampQueryFrequency() const;
+ 
+   };
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+index 29e3b6e..1833a5d 100644
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -1294,7 +1294,14 @@ namespace dxvk {
+     
+     HMONITOR monitor = GetDefaultMonitor();
+ 
+-    if (!SetMonitorDisplayMode(monitor, &devMode))
++    // DXVK_D3D9_NO_MODESWITCH=1: keep the desktop mode. On macOS a fullscreen
++    // mode switch makes Wine capture the displays, which we suspect stalls
++    // CPU writes to Metal-shared memory until the app is deactivated.
++    static const bool noModeSwitch = env::getEnvVar("DXVK_D3D9_NO_MODESWITCH") == "1";
++
++    if (noModeSwitch) {
++      Logger::info(str::format("D3D9: Skipping display mode change to ", devMode.dmPelsWidth, "x", devMode.dmPelsHeight));
++    } else if (!SetMonitorDisplayMode(monitor, &devMode))
+       return D3DERR_NOTAVAILABLE;
+ 
+     devMode.dmFields = DM_DISPLAYFREQUENCY;
+diff --git a/src/dxso/dxso_compiler.cpp b/src/dxso/dxso_compiler.cpp
+index 7cd6f72..f247c73 100644
+--- a/src/dxso/dxso_compiler.cpp
++++ b/src/dxso/dxso_compiler.cpp
+@@ -768,6 +768,14 @@ namespace dxvk {
+         ? m_samplers[idx].color[type]
+         : m_samplers[idx].depth[type];
+ 
++      // Metal (MoltenVK) cannot alias two textures at one binding, so the
++      // depth-compare variant reuses the color variable and the comparison
++      // is done in the shader (see emitSample).
++      if (depth) {
++        sampler = m_samplers[idx].color[type];
++        return;
++      }
++
+       spv::Dim dimensionality;
+ 
+       const char* suffix = "_2d";
+@@ -3281,6 +3289,37 @@ void DxsoCompiler::emitControlFlowGenericLoop(
+ 
+     uint32_t val;
+ 
++    if (depthCompare) {
++      // Emulated depth compare on the color view of the image. D3D9 depth
++      // textures compare with LESS_OR_EQUAL: (Dref <= texel) ? 1 : 0.
++      const uint32_t floatType = m_module.defFloatType(32);
++      const uint32_t vec4Type  = getVectorTypeId({ DxsoScalarType::Float32, 4 });
++      const uint32_t boolType  = m_module.defBoolType();
++      const uint32_t coordType = getVectorTypeId(coordinates.type);
++
++      uint32_t coord = coordinates.id;
++      uint32_t dref  = reference;
++
++      if (projected) {
++        uint32_t qIndex = samplerInfo.dimensions;
++        uint32_t q = m_module.opCompositeExtract(floatType, coord, 1, &qIndex);
++        std::array<uint32_t, 4> qs = { q, q, q, q };
++        uint32_t qVec = m_module.opCompositeConstruct(coordType, coordinates.type.ccount, qs.data());
++        coord = m_module.opFDiv(coordType, coord, qVec);
++        dref  = m_module.opFDiv(floatType, dref, q);
++      }
++
++      uint32_t texel = explicitLod
++        ? m_module.opImageSampleExplicitLod(vec4Type, sampledImage, coord, operands)
++        : m_module.opImageSampleImplicitLod(vec4Type, sampledImage, coord, operands);
++
++      uint32_t zero = 0;
++      uint32_t depthVal = m_module.opCompositeExtract(floatType, texel, 1, &zero);
++      uint32_t pass = m_module.opFOrdLessThanEqual(boolType, dref, depthVal);
++      val = m_module.opSelect(floatType, pass, m_module.constf32(1.0f), m_module.constf32(0.0f));
++      return val;
++    }
++
+     // No Fetch 4
+     if (projected) {
+       if (depthCompare) {
+diff --git a/src/dxvk/dxvk_buffer.h b/src/dxvk/dxvk_buffer.h
+index 4d94cec..bc572b3 100644
+--- a/src/dxvk/dxvk_buffer.h
++++ b/src/dxvk/dxvk_buffer.h
+@@ -232,6 +232,15 @@ namespace dxvk {
+      * \brief Allocates new buffer slice
+      * \returns The new buffer slice
+      */
++    static void logNewBacking(VkDeviceSize bytes) {
++      static std::atomic<uint32_t> s_count = { 0u };
++      static std::atomic<uint64_t> s_bytes = { 0ull };
++      uint32_t count = ++s_count;
++      uint64_t total = (s_bytes += bytes);
++      if (count <= 16 || !(count & 63))
++        Logger::warn(str::format("DxvkBuffer: new backing buffer #", count, " (", bytes >> 10, " KiB, ", total >> 20, " MiB total)"));
++    }
++
+     DxvkBufferSliceHandle allocSlice() {
+       std::unique_lock<sync::Spinlock> freeLock(m_freeMutex);
+       
+@@ -246,6 +255,7 @@ namespace dxvk {
+       if (unlikely(m_freeSlices.empty())) {
+         if (likely(!m_lazyAlloc)) {
+           DxvkBufferHandle handle = allocBuffer(m_physSliceCount, true);
++          logNewBacking(m_physSliceCount * m_physSliceStride);
+ 
+           for (uint32_t i = 0; i < m_physSliceCount; i++)
+             pushSlice(handle, i);
+diff --git a/src/dxvk/dxvk_gpu_query.cpp b/src/dxvk/dxvk_gpu_query.cpp
+index 40d3a09..ed39998 100644
+--- a/src/dxvk/dxvk_gpu_query.cpp
++++ b/src/dxvk/dxvk_gpu_query.cpp
+@@ -3,6 +3,8 @@
+ #include "dxvk_cmdlist.h"
+ #include "dxvk_device.h"
+ #include "dxvk_gpu_query.h"
++#include "../util/util_env.h"
++#include <cstdlib>
+ 
+ namespace dxvk {
+ 
+@@ -215,6 +217,9 @@ namespace dxvk {
+ 
+     m_pools.push_back(queryPool);
+ 
++    if (m_queryType == VK_QUERY_TYPE_OCCLUSION)
++      Logger::warn(str::format("DXVK: created occlusion query pool #", m_pools.size(), " (", m_queryPoolSize, " queries)"));
++
+     for (uint32_t i = 0; i < m_queryPoolSize; i++)
+       m_handles.push_back({ this, queryPool, i });
+   }
+@@ -223,7 +228,12 @@ namespace dxvk {
+ 
+ 
+   DxvkGpuQueryPool::DxvkGpuQueryPool(DxvkDevice* device)
+-  : m_occlusion(device, VK_QUERY_TYPE_OCCLUSION,                     16384),
++  : m_occlusion(device, VK_QUERY_TYPE_OCCLUSION,                     [] {
++      // DXVK_OCCL_POOL_SIZE overrides the occlusion pool size (MoltenVK binds one
++      // visibility buffer per Metal render pass, so mixing pools may lose results)
++      auto v = env::getEnvVar("DXVK_OCCL_POOL_SIZE");
++      return v.empty() ? 16384u : uint32_t(std::atoi(v.c_str()));
++    }()),
+     m_statistic(device, VK_QUERY_TYPE_PIPELINE_STATISTICS,           1024),
+     m_timestamp(device, VK_QUERY_TYPE_TIMESTAMP,                     1024),
+     m_xfbStream(device, VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 1024) {
+diff --git a/src/dxvk/dxvk_gpu_query.h b/src/dxvk/dxvk_gpu_query.h
+index 0c45d12..5229117 100644
+--- a/src/dxvk/dxvk_gpu_query.h
++++ b/src/dxvk/dxvk_gpu_query.h
+@@ -215,6 +215,11 @@ namespace dxvk {
+     void addQueryHandle(
+       const DxvkGpuQueryHandle& handle);
+ 
++    /// Diagnostics: number of Vulkan queries (render pass segments) this query used.
++    size_t handleCount() const {
++      return (m_handle.queryPool ? 1 : 0) + m_handles.size();
++    }
++
+   private:
+ 
+     Rc<vk::DeviceFn>    m_vkd;
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index 66c4131..5e4eb55 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -2,12 +2,84 @@
+ 
+ #include "dxvk_device.h"
+ #include "dxvk_graphics.h"
++
++#include <chrono>
++#include <deque>
+ #include "dxvk_pipemanager.h"
+ #include "dxvk_spec_const.h"
+ #include "dxvk_state_cache.h"
+ 
+ namespace dxvk {
+ 
++  namespace {
++
++    bool asyncPipelinesEnabled() {
++      static const bool enabled = env::getEnvVar("DXVK_ASYNC") == "1";
++      return enabled;
++    }
++
++    struct AsyncPipelineJob {
++      DxvkGraphicsPipeline*          pipeline;
++      DxvkGraphicsPipelineStateInfo  state;
++      const DxvkRenderPass*          renderPass;
++    };
++
++    /* Background workers that compile pipelines which a draw had to skip.
++     * Intentionally never destroyed; the threads are detached. */
++    class AsyncPipelineCompiler {
++
++    public:
++
++      static AsyncPipelineCompiler& get() {
++        static AsyncPipelineCompiler* s_compiler = new AsyncPipelineCompiler();
++        return *s_compiler;
++      }
++
++      void push(const AsyncPipelineJob& job) {
++        { std::lock_guard<dxvk::mutex> lock(m_mutex);
++          m_queue.push_back(job); }
++        m_cond.notify_one();
++      }
++
++      uint32_t cancel(DxvkGraphicsPipeline* pipeline) {
++        std::lock_guard<dxvk::mutex> lock(m_mutex);
++        uint32_t removed = 0;
++        for (auto i = m_queue.begin(); i != m_queue.end(); ) {
++          if (i->pipeline == pipeline) { i = m_queue.erase(i); removed++; }
++          else i++;
++        }
++        return removed;
++      }
++
++    private:
++
++      AsyncPipelineCompiler() {
++        uint32_t count = std::max(1u, std::min(4u, dxvk::thread::hardware_concurrency() / 2));
++        Logger::info(str::format("DXVK: Async pipeline compilation enabled, ", count, " workers"));
++        for (uint32_t i = 0; i < count; i++)
++          dxvk::thread([this] { run(); }).detach();
++      }
++
++      void run() {
++        env::setThreadName("dxvk-async");
++        while (true) {
++          AsyncPipelineJob job;
++          { std::unique_lock<dxvk::mutex> lock(m_mutex);
++            m_cond.wait(lock, [this] { return !m_queue.empty(); });
++            job = m_queue.front();
++            m_queue.pop_front(); }
++          job.pipeline->compileAsyncJob(job.state, job.renderPass);
++        }
++      }
++
++      dxvk::mutex                   m_mutex;
++      dxvk::condition_variable      m_cond;
++      std::deque<AsyncPipelineJob>  m_queue;
++    };
++
++  }
++
++
+   DxvkGraphicsPipeline::DxvkGraphicsPipeline(
+           DxvkPipelineManager*        pipeMgr,
+           DxvkGraphicsPipelineShaders shaders)
+@@ -41,6 +113,12 @@ namespace dxvk {
+   
+   
+   DxvkGraphicsPipeline::~DxvkGraphicsPipeline() {
++    if (asyncPipelinesEnabled() && m_asyncInFlight.load()) {
++      m_asyncInFlight -= AsyncPipelineCompiler::get().cancel(this);
++      while (m_asyncInFlight.load())
++        dxvk::this_thread::yield();
++    }
++
+     for (const auto& instance : m_pipelines)
+       this->destroyPipeline(instance.pipeline());
+   }
+@@ -70,6 +148,25 @@ namespace dxvk {
+       if (!this->validatePipelineState(state, true))
+         return VK_NULL_HANDLE;
+ 
++      // Asynchronous mode: compile in the background and skip this draw
++      // instead of stalling the frame for the (slow, on MoltenVK) compile.
++      if (asyncPipelinesEnabled()) {
++        std::lock_guard<dxvk::mutex> lock(m_asyncMutex);
++
++        if ((instance = this->findInstance(state, renderPass)))
++          return instance->pipeline();
++
++        for (const auto& pending : m_asyncPending) {
++          if (pending.second == renderPass && pending.first == state)
++            return VK_NULL_HANDLE;
++        }
++
++        m_asyncPending.emplace_back(state, renderPass);
++        m_asyncInFlight += 1;
++        AsyncPipelineCompiler::get().push({ this, state, renderPass });
++        return VK_NULL_HANDLE;
++      }
++
+       // Prevent other threads from adding new instances and check again
+       std::lock_guard<dxvk::mutex> lock(m_mutex);
+       instance = this->findInstance(state, renderPass);
+@@ -77,7 +174,13 @@ namespace dxvk {
+       if (!instance) {
+         // Keep pipeline object locked, at worst we're going to stall
+         // a state cache worker and the current thread needs priority.
++        auto t0 = std::chrono::high_resolution_clock::now();
+         instance = this->createInstance(state, renderPass);
++        auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t0).count();
++        static std::atomic<uint32_t> s_syncCompiles = { 0u };
++        uint32_t n = ++s_syncCompiles;
++        if (us > 2000)
++          Logger::warn(str::format("DxvkGraphicsPipeline: synchronous compile #", n, " took ", us / 1000, " ms"));
+         this->writePipelineStateToCache(state, renderPass->format());
+       }
+     }
+@@ -102,6 +205,30 @@ namespace dxvk {
+   }
+ 
+ 
++  void DxvkGraphicsPipeline::compileAsyncJob(
++    const DxvkGraphicsPipelineStateInfo& state,
++    const DxvkRenderPass*                renderPass) {
++    if (this->validatePipelineState(state, false)) {
++      std::lock_guard<dxvk::mutex> lock(m_mutex);
++
++      if (!this->findInstance(state, renderPass)) {
++        this->createInstance(state, renderPass);
++        this->writePipelineStateToCache(state, renderPass->format());
++      }
++    }
++
++    { std::lock_guard<dxvk::mutex> lock(m_asyncMutex);
++      for (auto i = m_asyncPending.begin(); i != m_asyncPending.end(); i++) {
++        if (i->second == renderPass && i->first == state) {
++          m_asyncPending.erase(i);
++          break;
++        }
++      } }
++
++    m_asyncInFlight -= 1;
++  }
++
++
+   DxvkGraphicsPipelineInstance* DxvkGraphicsPipeline::createInstance(
+     const DxvkGraphicsPipelineStateInfo& state,
+     const DxvkRenderPass*                renderPass) {
+diff --git a/src/dxvk/dxvk_graphics.h b/src/dxvk/dxvk_graphics.h
+index 50d16b1..4e79f5e 100644
+--- a/src/dxvk/dxvk_graphics.h
++++ b/src/dxvk/dxvk_graphics.h
+@@ -216,6 +216,16 @@ namespace dxvk {
+     void compilePipeline(
+       const DxvkGraphicsPipelineStateInfo&    state,
+       const DxvkRenderPass*                   renderPass);
++
++    /**
++     * \brief Background compile job (DXVK_ASYNC=1)
++     *
++     * Compiles a pipeline that a draw had to skip because it
++     * was not ready yet, and writes it to the state cache.
++     */
++    void compileAsyncJob(
++      const DxvkGraphicsPipelineStateInfo&    state,
++      const DxvkRenderPass*                   renderPass);
+     
+   private:
+     
+@@ -237,6 +247,11 @@ namespace dxvk {
+     alignas(CACHE_LINE_SIZE)
+     dxvk::mutex                               m_mutex;
+     sync::List<DxvkGraphicsPipelineInstance>  m_pipelines;
++
++    // Pipelines queued for asynchronous compilation
++    dxvk::mutex                               m_asyncMutex;
++    std::vector<std::pair<DxvkGraphicsPipelineStateInfo, const DxvkRenderPass*>> m_asyncPending;
++    std::atomic<uint32_t>                     m_asyncInFlight = { 0u };
+     
+     DxvkGraphicsPipelineInstance* createInstance(
+       const DxvkGraphicsPipelineStateInfo& state,
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index a33772c..0e57d76 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -428,6 +428,16 @@ namespace dxvk {
+       return DxvkDeviceMemory();
+     
+     if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
++      // Host-visible allocations are expensive on WoW64 + MoltenVK (fresh
++      // 32-bit mapping + page faults), so keep an eye on how many we make.
++      static std::atomic<uint32_t> s_count = { 0u };
++      static std::atomic<uint64_t> s_bytes = { 0ull };
++      uint32_t count = ++s_count;
++      uint64_t bytes = (s_bytes += size);
++
++      if (!(count & 63))
++        Logger::warn(str::format("DxvkMemoryAllocator: ", count, " host-visible allocations, ", bytes >> 20, " MiB total"));
++
+       VkResult status = m_vkd->vkMapMemory(m_vkd->device(), result.memHandle, 0, VK_WHOLE_SIZE, 0, &result.memPointer);
+ 
+       if (status != VK_SUCCESS) {
+@@ -525,14 +535,19 @@ namespace dxvk {
+     if (this->shouldFreeEmptyChunks(type->heap, 0))
+       return true;
+ 
+-    // Even if we have enough memory to spare, only keep
+-    // one chunk of each type around to save memory.
++    // Even if we have enough memory to spare, only keep a few empty
++    // chunks of each type around to save memory. Keep more of them for
++    // host-visible memory, since re-allocating it is very expensive on
++    // WoW64 + MoltenVK and staging uploads cycle through it constantly.
++    uint32_t maxEmpty = (type->memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? 8 : 1;
++    uint32_t numEmpty = 0;
++
+     for (const auto& c : type->chunks) {
+       if (c != chunk && c->isEmpty() && c->isCompatible(chunk))
+-        return true;
++        numEmpty += 1;
+     }
+ 
+-    return false;
++    return numEmpty >= maxEmpty;
+   }
+ 
+ 
+diff --git a/src/vulkan/vulkan_presenter.cpp b/src/vulkan/vulkan_presenter.cpp
+index c71389b..b28c96b 100644
+--- a/src/vulkan/vulkan_presenter.cpp
++++ b/src/vulkan/vulkan_presenter.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "../dxvk/dxvk_format.h"
+ 
++#include <chrono>
++
+ namespace dxvk::vk {
+ 
+   Presenter::Presenter(
+@@ -48,9 +50,13 @@ namespace dxvk::vk {
+ 
+     // Don't acquire more than one image at a time
+     if (true || m_acquireStatus == VK_NOT_READY) {
++      auto t0 = std::chrono::high_resolution_clock::now();
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++      auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t0).count();
++      if (us > 50000)
++        Logger::warn(str::format("Presenter: vkAcquireNextImageKHR took ", us / 1000, " ms (status ", m_acquireStatus, ")"));
+     }
+     
+     if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
+@@ -74,7 +80,11 @@ namespace dxvk::vk {
+     info.pImageIndices      = &m_imageIndex;
+     info.pResults           = nullptr;
+ 
++    auto t0 = std::chrono::high_resolution_clock::now();
+     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
++    auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t0).count();
++    if (us > 50000)
++      Logger::warn(str::format("Presenter: vkQueuePresentKHR took ", us / 1000, " ms (status ", status, ")"));
+ 
+     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
+       return status;
