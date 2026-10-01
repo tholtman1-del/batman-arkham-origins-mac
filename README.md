@@ -16,6 +16,79 @@ Test result: M1 Pro, CrossOver 26.3, macOS 27, 1920×1200, high settings, in-gam
 Without this package the game takes about 5 minutes to reach the menu, and every loading screen runs
 at 1–3 FPS.
 
+## What was wrong and how it is fixed
+
+Each problem below is listed with what you see, the cause, and the fix in this package.
+
+### 1. Gray screen crash at startup
+
+**What you see:** the game window stays gray, and then the Wine debugger appears. The game never
+reaches the menu.
+
+**Cause:** Arkham Origins is a **32-bit** game. CrossOver's best DirectX 11 layer, Apple's D3DMetal,
+only supports 64-bit programs, so for this game CrossOver falls back to Wine's own DirectX 11 layer
+(running on Vulkan). That layer cannot create one texture format the game needs at startup
+(`R32G32B32_FLOAT`), so texture creation fails. The game keeps going with an empty texture, crashes,
+and then its own crash reporter crashes as well, which leaves the gray window and the debugger.
+
+**Fix:** the game runs on a translation layer that does support 32-bit games:
+
+- **DX11 mode:** [DXMT](https://github.com/3Shain/dxmt), which translates DirectX 11 directly to Metal.
+- **DX9 mode:** DXVK, which translates DirectX 9 to Vulkan, and then MoltenVK to Metal.
+
+### 2. Very slow loading (5 minutes to the menu)
+
+**What you see:** every loading screen crawls at 1–3 FPS. The menu takes about 5 minutes, and some
+loading screens only continue after you switch to another window and back.
+
+**Cause:** six of the game's DLLs (libcurl, libeay32/ssleay32 (OpenSSL), PhysXExtensions, the CUDA
+runtime and libresample) are old enough to lack the `NX_COMPAT` flag. When a program loads such a DLL,
+Wine plays it safe and makes **all** of the program's memory read-write-execute. Under Rosetta (the
+game is x86 code on an ARM Mac), writing to memory that is also executable is very expensive, because
+Rosetta must check whether code was modified. The graphics layer writes to memory constantly while
+loading, so loading slows to a crawl.
+
+**Fix:** the installer sets the `NX_COMPAT` flag in those DLLs, which changes one bit in each file
+header. Nothing else in the files changes, and the originals are backed up and restored by the
+uninstaller. Loading screens now take seconds.
+
+### 3. DX11 was a slideshow, and stutter on camera turns
+
+**What you see:** with CrossOver's own DXMT, version 0.72, the DX11 version runs at a few FPS. After
+updating DXMT it runs well, but drops to 30–40 FPS when you turn the camera quickly.
+
+**Fix:**
+
+- DXMT is updated to **v0.80**, the official release, downloaded at install time and verified by
+  checksum.
+- Its `d3d11.dll` is patched. When the game shows something new, DXMT has to compile a Metal
+  "pipeline" for it, and DXMT normally freezes the frame until that compile is done. With the patch,
+  those draws are skipped for a moment while the pipeline compiles in the background, so the camera
+  stays smooth.
+- The patch also fixes a crash in that code path.
+
+### 4. DX9: broken shadows and lighting, stutter
+
+**What you see:** with CrossOver's DXVK, characters and scenes have broken lighting, and the game
+stutters for 150–190 ms whenever a new effect appears.
+
+**Cause:** for shadows, the game samples the same depth texture in two ways (as a normal texture and
+as a "shadow" texture). DXVK binds both views to one slot, which Vulkan allows but Metal (through
+MoltenVK) does not, so those shaders fail. The stutter comes from shader pipelines compiling while
+the game waits.
+
+**Fix:** DXVK's `d3d9.dll` is patched:
+
+- The shadow comparison is computed inside the shader, so only one texture binding is needed.
+- Pipelines compile in the background instead of blocking the game.
+- It keeps more upload memory cached.
+
+### 5. PhysX
+
+"Hardware Accelerated PhysX" needs an NVIDIA GPU. On a Mac it runs on the CPU, under Rosetta, and the
+game drops to about 30 FPS with 4 FPS minimums. The launcher turns it off on every start (see
+[Recommended in-game settings](#recommended-in-game-settings)).
+
 ## Requirements
 
 - Apple Silicon Mac (tested on M1 Pro)
@@ -135,6 +208,12 @@ off by default.
 - DXVK: zlib/libpng license, see `licenses/DXVK-LICENSE`.
 - DXMT: MIT license, see `licenses/DXMT-LICENSE`.
 - The scripts in this repository: MIT.
+
+## Credits
+
+Made by Tibor Holtman together with Claude Code (an AI coding assistant): Claude traced the problems,
+wrote the patches and the installer, and every build was tested in the game on a real Mac. Thanks to
+the DXVK and DXMT developers, whose work this builds on.
 
 This project is not affiliated with CodeWeavers, Warner Bros. Games, GOG or Valve. You need your own
 CrossOver license and your own copy of the game.
